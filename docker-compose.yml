@@ -18,5 +18,18 @@ services:
       timeout: 5s
       retries: 20
 
+  mongodb:
+    image: mongo:7.0
+    container_name: lab3_mongodb
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_DATABASE: lab3_db
+    volumes:
+      - mongodb_data:/data/db
+    restart: unless-stopped
+
 volumes:
   pgdata_lab2:
+  mongodb_data:
+    driver: local

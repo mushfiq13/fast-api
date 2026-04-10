@@ -2,9 +2,11 @@ import os
 from dotenv import load_dotenv
 from fastapi import FastAPI, Depends, HTTPException, status
 from sqlalchemy.orm import Session
+from bson import ObjectId
+from datetime import datetime
 
-from .database import SessionLocal
-from .models import User
+from .database import SessionLocal, connect_to_mongodb, close_mongodb_connection, get_mongo_db
+from .models import User, NoteCreate, NoteResponse, NoteUpdate
 from .schemas import UserCreate, UserOut, UserUpdate
 
 # Load environment variables
@@ -16,6 +18,15 @@ app = FastAPI(
     description="A CRUD API for user management with PostgreSQL",
     version="1.0.0"
 )
+
+# Startup and shutdown events
+@app.on_event("startup")
+async def startup_event():
+    await connect_to_mongodb()
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await close_mongodb_connection()
 
 # Dependency: Database Session
 def get_db():
@@ -119,5 +130,112 @@ def delete_user(user_id: int, db: Session = Depends(get_db)):
 
     db.delete(user)     # Mark for deletion
     db.commit()         # Execute deletion
+
+    return None
+
+# Helper function to convert MongoDB document to response format
+def note_helper(note) -> dict:
+    """
+    Convert MongoDB document to API response format.
+
+    Converts ObjectId to string and structures data according to NoteResponse schema.
+    """
+    return {
+        "id": str(note["_id"]),
+        "title": note["title"],
+        "content": note["content"],
+        "tags": note.get("tags", []),
+        "created_at": note["created_at"]
+    }
+
+@app.post("/notes", response_model=NoteResponse, status_code=status.HTTP_201_CREATED)
+async def create_note(note: NoteCreate):
+    db = get_mongo_db()
+
+    # Prepare note document
+    note_dict: dict[str, any] = note.model_dump()
+    note_dict["created_at"] = datetime.utcnow()
+
+    # Insert into MongoDB
+    result = await db.notes.insert_one(note_dict)
+
+    # Retrieve the created note
+    created_note = await db.notes.find_one({"_id": result.inserted_id})
+
+    return note_helper(created_note)
+
+@app.get("/notes", response_model=list[NoteResponse], status_code=status.HTTP_200_OK)
+async def get_all_notes():
+    db = get_mongo_db()
+
+    # Find all notes, sort by creation time (newest first)
+    notes = await db.notes.find().sort("created_at", -1).to_list(length=100)
+
+    return [note_helper(note) for note in notes]
+
+@app.get("/notes/{note_id}", response_model=NoteResponse)
+async def get_note(note_id: str):
+    # Validate ObjectId format
+    if not ObjectId.is_valid(note_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid note ID format")
+
+    db = get_mongo_db()
+    note = await db.notes.find_one({"_id": ObjectId(note_id)})
+
+    if not note:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Note not found")
+
+    return note_helper(note)
+
+@app.put("/notes/{note_id}", response_model=NoteResponse)
+async def update_note(note_id: str, note_update: NoteUpdate):
+    if not ObjectId(note_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid note ID format")
+
+    db = get_mongo_db()
+
+    # Only include fields that were provided
+    update_data = note_update.model_dump(exclude_unset=True)
+
+    if not update_data:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No fields provided for update")
+
+    # Update the note
+    result = await db.notes.update_one(
+        {"_id": ObjectId(note_id)},
+        {"$set": update_data}
+    )
+
+    if result.matched_count == 0:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Note not found")
+
+    # Retrieve and return updated note
+    updated_note = await db.notes.find_one({"_id": ObjectId(note_id)})
+    return note_helper(updated_note)
+
+async def delete_note(note_id: str):
+    # Validate ObjectId format
+    if not ObjectId(note_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid note ID format")
+
+    db = get_mongo_db()
+    result = await db.notes.delete_one({"_id": ObjectId(note_id)})
+
+    if result.deleted_count == 0:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Note not found")
 
     return None
