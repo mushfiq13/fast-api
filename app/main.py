@@ -41,98 +41,6 @@ def get_db():
 def ping():
     return {"message": "pong"}
 
-# CREATE: Add a new user
-@app.post("/users", response_model=UserOut, status_code=status.HTTP_201_CREATED)
-def create_user(payload: UserCreate, db: Session = Depends(get_db)):
-    # Check if email or username already exists
-    existing_user = db.query(User).filter(
-        (User.email == payload.email) | (User.username == payload.username)
-    ).first()
-
-    if existing_user:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Email or username already exists")
-
-    # Create new user
-    user = User(email=payload.email, username=payload.username)
-    db.add(user)        # Add to session
-    db.commit()         # Save to database
-    db.refresh(user)    # Reload from database (get the ID)
-
-    return user
-
-# READ: Get all users
-@app.get("/users", response_model=list[UserOut], status_code=status.HTTP_200_OK)
-def list_users(db: Session = Depends(get_db)):
-    return db.query(User).order_by(User.id.asc()).all()
-
-# READ: Get single user by ID
-@app.get("/users/{user_id}", response_model=UserOut)
-def get_user(user_id: int, db: Session = Depends(get_db)):
-    user = db.get(User, user_id)
-
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found")
-
-    return user
-
-# UPDATE: Modify existing user
-@app.put("/users/{user_id}", response_model=UserOut)
-def update_user(
-    user_id: int,
-    payload: UserUpdate,
-    db: Session = Depends(get_db)
-):
-    # Get existing user
-    user  = db.get(User, user_id)
-
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found")
-
-    # Update email if provided and different
-    if payload.email and payload.email != user.email:
-        # Check if email already taken
-        if db.query(User).filter(User.email == payload.email).first():
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Email already in use")
-        user.email = payload.email
-
-    # Update username if provided and different
-    if payload.username and payload.username != user.username:
-        # Check if username already taken
-        if db.query(User).filter(User.username == payload.username).first():
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Username already in use")
-        user.username = payload.username
-
-    db.add(user)        # Mark as modified
-    db.commit()         # Save changes
-    db.refresh(user)    # Reload from database
-
-    return user
-
-# DELETE: Remove a user
-@app.delete("/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_user(user_id: int, db: Session = Depends(get_db)):
-    user = db.get(User, user_id)
-
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found")
-
-    db.delete(user)     # Mark for deletion
-    db.commit()         # Execute deletion
-
-    return None
-
 # Helper function to convert MongoDB document to response format
 def note_helper(note) -> dict:
     """
@@ -237,5 +145,198 @@ async def delete_note(note_id: str):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Note not found")
+
+    return None
+
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials, OAuth2PasswordRequestForm
+from datetime import timedelta
+from app.schemas import Token, TokenData
+from app.auth import (
+    hash_password,
+    verify_password,
+    create_access_token,
+    decode_access_token,
+    ACCESS_TOKEN_EXPIRE_MINUTES
+)
+
+# HTTPBearer scheme for token authentication
+security = HTTPBearer()
+
+# Dependency: Get current authenticated user
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_db)
+) -> User:
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+    # Extract token from credentials
+    token = credentials.credentials
+
+    # Decode token
+    email = decode_access_token(token)
+    if email is None:
+        raise credentials_exception
+
+    # Get user from database
+    user = db.query(User).filter(User.email == email).first()
+    if user is None:
+        raise credentials_exception
+
+    return user
+
+def require_admin(current_user: User = Depends(get_current_user)):
+    if current_user.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin access required"
+        )
+    return current_user
+
+@app.post("/auth/signup", response_model=UserOut, status_code=status.HTTP_201_CREATED)
+def signup(user_data: UserCreate, db: Session = Depends(get_db)):
+    # Check if email or username already exists
+    existing_user = db.query(User).filter(
+        (User.email == user_data.email) | (User.username == user_data.username)
+    ).first()
+
+    if existing_user:
+        if existing_user.email == user_data.email:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Email already registered"
+            )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Username already taken"
+            )
+
+    # Hash password
+    hashed_password = hash_password(user_data.password)
+
+    # Create new user
+    new_user = User(
+        email=user_data.email,
+        username=user_data.username,
+        password_hash=hashed_password
+    )
+    db.add(new_user)        # Add to session
+    db.commit()             # Save to database
+    db.refresh(new_user)    # Reload from database (get the ID)
+
+    return new_user
+
+@app.post("/auth/login", response_model=Token)
+def login(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(get_db)
+):
+    # Find user by username
+    user = db.query(User).filter(User.username == form_data.username).first()
+
+    # Check if user exists and password is correct
+    if not user or not verify_password(form_data.password, user.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # Create access token
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user.email},
+        expires_delta=access_token_expires
+    )
+
+    return {"access_token": access_token, "token_type": "bearer"}
+
+@app.get("/profile", response_model=UserOut)
+def get_profile(current_user: User = Depends(get_current_user)):
+    return current_user
+
+# READ: Get all users
+@app.get("/users", response_model=list[UserOut], status_code=status.HTTP_200_OK)
+def get_users(db: Session = Depends(get_db)):
+    return db.query(User).order_by(User.id.asc()).all()
+
+# READ: Get single user by ID
+@app.get("/users/{user_id}", response_model=UserOut)
+def get_user(user_id: int, db: Session = Depends(get_db)):
+    user = db.get(User, user_id)
+
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found")
+
+    return user
+
+# UPDATE: Modify existing user
+@app.put("/users/{user_id}", response_model=UserOut)
+def update_user(
+    user_id: int,
+    payload: UserUpdate,
+    db: Session = Depends(get_db)
+):
+    # Get existing user
+    user  = db.get(User, user_id)
+
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found")
+
+    # Update email if provided and different
+    if payload.email and payload.email != user.email:
+        # Check if email already taken
+        if db.query(User).filter(User.email == payload.email).first():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Email already in use")
+        user.email = payload.email
+
+    # Update username if provided and different
+    if payload.username and payload.username != user.username:
+        # Check if username already taken
+        if db.query(User).filter(User.username == payload.username).first():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Username already in use")
+        user.username = payload.username
+
+    db.add(user)        # Mark as modified
+    db.commit()         # Save changes
+    db.refresh(user)    # Reload from database
+
+    return user
+
+# DELETE: Remove a user
+@app.delete("/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_user(
+    user_id: int,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db)
+):
+    # Prevent admin from deleting themselves
+    if admin.id == user_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="You cannot delete your own account")
+
+    # Find the user to delete
+    user = db.get(User, user_id)
+
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found")
+
+    db.delete(user)     # Mark for deletion
+    db.commit()         # Execute deletion
 
     return None

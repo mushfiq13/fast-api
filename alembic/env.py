@@ -22,6 +22,7 @@ load_dotenv()
 # Override sqlalchemy.url with DATABASE_URL from .env
 config.set_main_option("sqlalchemy.url", os.getenv("DATABASE_URL"))
 
+# Import your models
 from app.database import Base
 from app.models import User
 

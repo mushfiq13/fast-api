@@ -1,5 +1,5 @@
 from .database import Base
-from sqlalchemy import Column, Integer, String, UniqueConstraint, DateTime, Boolean
+from sqlalchemy import Column, Integer, String, DateTime, Boolean
 from sqlalchemy.sql import func
 
 class User(Base):
@@ -28,14 +28,14 @@ class User(Base):
         index=True         # Create index for faster lookups
     )
 
+    # NEVER store plain password!
+    password_hash = Column(String(255), nullable=False)
+
+    # Available Roles: "user", "admin"
+    role = Column(String(5), nullable=False, server_default="user")
+
     is_active = Column(Boolean, nullable=False, server_default="True")
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
-
-    # Table-level constraints
-    __table_args__ = (
-        UniqueConstraint("email", name="uq_users_email"),
-        UniqueConstraint("username", name="uq_users_username"),
-    )
 
     def __repr__(self):
         """String representation of User object."""
