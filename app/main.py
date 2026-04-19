@@ -1,13 +1,24 @@
 import os
 from dotenv import load_dotenv
 from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials, OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from bson import ObjectId
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from .database import SessionLocal, connect_to_mongodb, close_mongodb_connection, get_mongo_db
-from .models import User, NoteCreate, NoteResponse, NoteUpdate
-from .schemas import UserCreate, UserOut, UserUpdate
+from .database import SessionLocal
+from .mongodb import connect_to_mongodb, close_mongodb_connection, get_mongodb
+from .models import User
+from .schemas import Token, UserCreate, UserOut, UserUpdate, \
+    NoteCreate, NoteResponse, NoteUpdate, \
+    ActivityLogCreate, ActivityLogOut
+from app.auth import (
+    hash_password,
+    verify_password,
+    create_access_token,
+    decode_access_token,
+    ACCESS_TOKEN_EXPIRE_MINUTES
+)
 
 # Load environment variables
 load_dotenv()
@@ -58,7 +69,7 @@ def note_helper(note) -> dict:
 
 @app.post("/notes", response_model=NoteResponse, status_code=status.HTTP_201_CREATED)
 async def create_note(note: NoteCreate):
-    db = get_mongo_db()
+    db = get_mongodb()
 
     # Prepare note document
     note_dict: dict[str, any] = note.model_dump()
@@ -74,7 +85,7 @@ async def create_note(note: NoteCreate):
 
 @app.get("/notes", response_model=list[NoteResponse], status_code=status.HTTP_200_OK)
 async def get_all_notes():
-    db = get_mongo_db()
+    db = get_mongodb()
 
     # Find all notes, sort by creation time (newest first)
     notes = await db.notes.find().sort("created_at", -1).to_list(length=100)
@@ -89,7 +100,7 @@ async def get_note(note_id: str):
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid note ID format")
 
-    db = get_mongo_db()
+    db = get_mongodb()
     note = await db.notes.find_one({"_id": ObjectId(note_id)})
 
     if not note:
@@ -106,7 +117,7 @@ async def update_note(note_id: str, note_update: NoteUpdate):
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid note ID format")
 
-    db = get_mongo_db()
+    db = get_mongodb()
 
     # Only include fields that were provided
     update_data = note_update.model_dump(exclude_unset=True)
@@ -138,7 +149,7 @@ async def delete_note(note_id: str):
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid note ID format")
 
-    db = get_mongo_db()
+    db = get_mongodb()
     result = await db.notes.delete_one({"_id": ObjectId(note_id)})
 
     if result.deleted_count == 0:
@@ -147,17 +158,6 @@ async def delete_note(note_id: str):
             detail="Note not found")
 
     return None
-
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials, OAuth2PasswordRequestForm
-from datetime import timedelta
-from app.schemas import Token, TokenData
-from app.auth import (
-    hash_password,
-    verify_password,
-    create_access_token,
-    decode_access_token,
-    ACCESS_TOKEN_EXPIRE_MINUTES
-)
 
 # HTTPBearer scheme for token authentication
 security = HTTPBearer()
@@ -231,7 +231,7 @@ def signup(user_data: UserCreate, db: Session = Depends(get_db)):
     return new_user
 
 @app.post("/auth/login", response_model=Token)
-def login(
+async def login(
     form_data: OAuth2PasswordRequestForm = Depends(),
     db: Session = Depends(get_db)
 ):
@@ -246,6 +246,15 @@ def login(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    # Log login activity to MongoDB
+    mongodb = get_mongodb()
+    await mongodb.activity_logs.insert_one({
+        "user_id": user.id,
+        "action": "login",
+        "timestamp": datetime.utcnow(),
+        "metadata": {}
+    })
+
     # Create access token
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
@@ -256,12 +265,33 @@ def login(
     return {"access_token": access_token, "token_type": "bearer"}
 
 @app.get("/profile", response_model=UserOut)
-def get_profile(current_user: User = Depends(get_current_user)):
+async def get_profile(current_user: User = Depends(get_current_user)):
+    # Automatic logging: log profile view
+    mongodb = get_mongodb()
+    await mongodb.activity_logs.insert_one({
+        "user_id": current_user.id,
+        "action": "profile_view",
+        "timestamp": datetime.utcnow(),
+        "metadata": {}
+    })
+
     return current_user
 
 # READ: Get all users
 @app.get("/users", response_model=list[UserOut], status_code=status.HTTP_200_OK)
-def get_users(db: Session = Depends(get_db)):
+async def get_users(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    # Automatic logging: log users list view
+    mongodb = get_mongodb()
+    await mongodb.activity_logs.insert_one({
+        "user_id": current_user.id,
+        "action": "users_list_view",
+        "timestamp": datetime.utcnow(),
+        "metadata": {}
+    })
+
     return db.query(User).order_by(User.id.asc()).all()
 
 # READ: Get single user by ID
@@ -340,3 +370,68 @@ def delete_user(
     db.commit()         # Execute deletion
 
     return None
+
+@app.post("/logs", response_model=dict, status_code=status.HTTP_201_CREATED)
+async def create_custom_log(
+    log_data: ActivityLogCreate,
+    current_user: User = Depends(get_current_user)
+):
+    mongodb = get_mongodb()
+
+    log_document = {
+        "user_id": current_user.id,
+        "action": log_data.action,
+        "timestamp": datetime.utcnow(),
+        "metadata": log_data.metadata or {}
+    }
+
+    result = await mongodb.activity_logs.insert_one(log_document)
+
+    return { "log_id": str(result.inserted_id) }
+
+@app.get("/logs", response_model=list[ActivityLogOut], status_code=status.HTTP_200_OK)
+async def get_my_logs(
+    current_user: User = Depends(get_current_user),
+    limit: int = 10
+):
+    mongodb = get_mongodb()
+
+    cursor = mongodb.activity_logs.find(
+        {"user_id": current_user.id}
+    ).sort("timestamp", -1).limit(limit)
+
+    logs = await cursor.to_list(length=limit)
+
+    # Convert ObjectId to string for JSON serialization
+    for log in logs:
+        log["_id"] = str(log["_id"])
+
+    return logs
+
+@app.get("/users/{user_id}/logs", response_model=list[ActivityLogOut], status_code=status.HTTP_200_OK)
+async def get_user_logs(
+    user_id: int,
+    admin: User = Depends(require_admin),
+    limit: int = 10,
+    db: Session = Depends(get_db)
+):
+    # Check if user exists in PostgreSQL
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found")
+
+    # Get logs from MongoDB
+    mongodb = get_mongodb()
+    cursor = mongodb.activity_logs.find(
+        {"user_id": user_id}
+    ).sort("timestamp", -1).limit(limit)
+
+    logs = await cursor.to_list(length=limit)
+
+    # Convert ObjectId to string for JSON serialization
+    for log in logs:
+        logs["_id"] = str(log["_id"])
+
+    return logs

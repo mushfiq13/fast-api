@@ -11,7 +11,7 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - pgdata_lab2:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d lab2_db"]
       interval: 5s
@@ -21,15 +21,22 @@ services:
   mongodb:
     image: mongo:7.0
     container_name: lab3_mongodb
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: mongodb
+      MONGO_INITDB_ROOT_PASSWORD: mongodb
+      MONGO_INITDB_DATABASE: lab3_db
     ports:
       - "27017:27017"
-    environment:
-      MONGO_INITDB_DATABASE: lab3_db
     volumes:
       - mongodb_data:/data/db
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
 
 volumes:
-  pgdata_lab2:
+  pgdata:
   mongodb_data:
     driver: local
