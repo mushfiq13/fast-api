@@ -1,6 +1,6 @@
 import os
 from dotenv import load_dotenv
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, Query, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials, OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from bson import ObjectId
@@ -8,9 +8,10 @@ from datetime import datetime, timedelta
 
 from .database import SessionLocal
 from .mongodb import connect_to_mongodb, close_mongodb_connection, get_mongodb
+from .elasticsearch import connect_to_elasticsearch, close_elasticsearch_connection, get_elasticsearch
 from .models import User
 from .schemas import Token, UserCreate, UserOut, UserUpdate, \
-    NoteCreate, NoteResponse, NoteUpdate, \
+    NoteCreate, NoteOut, NoteUpdate, SearchResult, \
     ActivityLogCreate, ActivityLogOut
 from app.auth import (
     hash_password,
@@ -23,6 +24,8 @@ from app.auth import (
 # Load environment variables
 load_dotenv()
 
+ELASTICSEARCH_INDEX = os.getenv("ELASTICSEARCH_INDEX")
+
 # Create FastAPI instance
 app = FastAPI(
     title=os.getenv("APP_NAME", "FastAPI Application"),
@@ -34,10 +37,12 @@ app = FastAPI(
 @app.on_event("startup")
 async def startup_event():
     await connect_to_mongodb()
+    await connect_to_elasticsearch()
 
 @app.on_event("shutdown")
 async def shutdown_event():
     await close_mongodb_connection()
+    await close_elasticsearch_connection()
 
 # Dependency: Database Session
 def get_db():
@@ -67,32 +72,47 @@ def note_helper(note) -> dict:
         "created_at": note["created_at"]
     }
 
-@app.post("/notes", response_model=NoteResponse, status_code=status.HTTP_201_CREATED)
+@app.post("/notes", response_model=NoteOut, status_code=status.HTTP_201_CREATED)
 async def create_note(note: NoteCreate):
-    db = get_mongodb()
+    mongodb = get_mongodb()
+    es = get_elasticsearch()
 
     # Prepare note document
     note_dict: dict[str, any] = note.model_dump()
     note_dict["created_at"] = datetime.utcnow()
 
     # Insert into MongoDB
-    result = await db.notes.insert_one(note_dict)
+    result = await mongodb.notes.insert_one(note_dict)
 
-    # Retrieve the created note
-    created_note = await db.notes.find_one({"_id": result.inserted_id})
+    # Index in Elasticsearch
+    await es.index(
+        index=ELASTICSEARCH_INDEX,
+        id=str(result.inserted_id),
+        document={
+            "title": note.title,
+            "content": note.content,
+            "tags": note.tags,
+            "created_at": note_dict["created_at"].isoformat()
+        }
+    )
 
-    return note_helper(created_note)
+    # Return created note
+    note_dict["_id"] = str(result.inserted_id)
+    return note_dict
 
-@app.get("/notes", response_model=list[NoteResponse], status_code=status.HTTP_200_OK)
-async def get_all_notes():
-    db = get_mongodb()
+@app.get("/notes", response_model=list[NoteOut], status_code=status.HTTP_200_OK)
+async def get_all_notes(limit: int = Query(default=10, le=100)):
+    mongodb = get_mongodb()
 
     # Find all notes, sort by creation time (newest first)
-    notes = await db.notes.find().sort("created_at", -1).to_list(length=100)
+    notes = await mongodb.notes.find().sort("created_at", -1).to_list(length=limit)
 
-    return [note_helper(note) for note in notes]
+    for note in notes:
+        note["_id"] = str(note["_id"])
 
-@app.get("/notes/{note_id}", response_model=NoteResponse)
+    return notes
+
+@app.get("/notes/{note_id}", response_model=NoteOut)
 async def get_note(note_id: str):
     # Validate ObjectId format
     if not ObjectId.is_valid(note_id):
@@ -100,17 +120,18 @@ async def get_note(note_id: str):
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid note ID format")
 
-    db = get_mongodb()
-    note = await db.notes.find_one({"_id": ObjectId(note_id)})
+    mongodb = get_mongodb()
+    note = await mongodb.notes.find_one({"_id": ObjectId(note_id)})
 
     if not note:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Note not found")
 
-    return note_helper(note)
+    note["_id"] = str(note["_id"])
+    return note
 
-@app.put("/notes/{note_id}", response_model=NoteResponse)
+@app.put("/notes/{note_id}", response_model=NoteOut)
 async def update_note(note_id: str, note_update: NoteUpdate):
     if not ObjectId(note_id):
         raise HTTPException(
@@ -142,6 +163,7 @@ async def update_note(note_id: str, note_update: NoteUpdate):
     updated_note = await db.notes.find_one({"_id": ObjectId(note_id)})
     return note_helper(updated_note)
 
+@app.delete("/notes/{note_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_note(note_id: str):
     # Validate ObjectId format
     if not ObjectId(note_id):
@@ -149,15 +171,68 @@ async def delete_note(note_id: str):
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid note ID format")
 
-    db = get_mongodb()
-    result = await db.notes.delete_one({"_id": ObjectId(note_id)})
+    mongodb = get_mongodb()
+    result = await mongodb.notes.delete_one({"_id": ObjectId(note_id)})
 
     if result.deleted_count == 0:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Note not found")
 
+    # Delete from Elasticsearch
+    es = get_elasticsearch()
+    try:
+        await es.delete(index=ELASTICSEARCH_INDEX,  id=note_id)
+    except Exception as e:
+        print(f"Error deleting note from Elasticsearch: {e}")
+
     return None
+
+@app.get("/search", response_model=list[SearchResult], status_code=status.HTTP_200_OK)
+async def search_notes(
+    q: str = Query(..., min_length=1, description="Search query"),
+    limit: int = Query(default=10, le=100)
+):
+    es = get_elasticsearch()
+
+    # Build Elasticsearch query
+    search_body = {
+        "query": {
+            "multi_match": {
+                "query": q,
+                "fields": ["title^3", "content"],
+                "fuzziness": "AUTO"
+            }
+        },
+        "highlight": {
+            "fields": {
+                "title": {},
+                "content": {"fragment_size": 150}
+            }
+        },
+        "size": limit
+    }
+
+    # Execute search
+    response = await es.search(
+        index=ELASTICSEARCH_INDEX,
+        body=search_body
+    )
+
+    # Format results
+    results = []
+    for hit in response["hits"]["hits"]:
+        result = SearchResult(
+            id=hit["_id"],
+            title=hit["_source"]["title"],
+            content=hit["_source"]["content"],
+            tags=hit["_source"]["tags"],
+            score=hit["_score"],
+            highlight=hit.get("highlight")
+        )
+        results.append(result)
+
+    return results
 
 # HTTPBearer scheme for token authentication
 security = HTTPBearer()
