@@ -17,3 +17,5 @@ python-multipart==0.0.18           # Required for OAuth2 password flow (form dat
 
 elasticsearch==8.11.1 # Official Python client (elasticsearch-py) for Elasticsearch
 aiohttp==3.13.2 # Required by elasticsearch async client
+
+redis==5.0.1 # Redis client for Python

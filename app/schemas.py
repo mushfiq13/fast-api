@@ -80,6 +80,7 @@ class NoteOut(BaseModel):
     created_at: datetime = Field(..., description="Timestamp when note was created")
 
     class Config:
+        populate_by_name = True
         json_schema_extra = {
             "example": {
                 "id": "60c72b2f9b1d4c3a5e8f9a1b",

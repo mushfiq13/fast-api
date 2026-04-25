@@ -1,10 +1,12 @@
 import os
+import time
 from dotenv import load_dotenv
-from fastapi import FastAPI, Depends, HTTPException, Query, status
+from fastapi import FastAPI, Depends, HTTPException, Query, status, Header
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials, OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from bson import ObjectId
 from datetime import datetime, timedelta
+from typing import List, Optional
 
 from .database import SessionLocal
 from .mongodb import connect_to_mongodb, close_mongodb_connection, get_mongodb
@@ -13,6 +15,7 @@ from .models import User
 from .schemas import Token, UserCreate, UserOut, UserUpdate, \
     NoteCreate, NoteOut, NoteUpdate, SearchResult, \
     ActivityLogCreate, ActivityLogOut
+from .redis_client import connect_to_redis, close_redis_connection, cache_get, cache_set, cache_delete, cache_delete_pattern
 from app.auth import (
     hash_password,
     verify_password,
@@ -38,11 +41,13 @@ app = FastAPI(
 async def startup_event():
     await connect_to_mongodb()
     await connect_to_elasticsearch()
+    await connect_to_redis()
 
 @app.on_event("shutdown")
 async def shutdown_event():
     await close_mongodb_connection()
     await close_elasticsearch_connection()
+    await close_redis_connection()
 
 # Dependency: Database Session
 def get_db():
@@ -71,6 +76,43 @@ def note_helper(note) -> dict:
         "tags": note.get("tags", []),
         "created_at": note["created_at"]
     }
+
+# HTTPBearer scheme for token authentication
+security = HTTPBearer()
+
+# Dependency: Get current authenticated user
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_db)
+) -> User:
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+    # Extract token from credentials
+    token = credentials.credentials
+
+    # Decode token
+    email = decode_access_token(token)
+    if email is None:
+        raise credentials_exception
+
+    # Get user from database
+    user = db.query(User).filter(User.email == email).first()
+    if user is None:
+        raise credentials_exception
+
+    return user
+
+def require_admin(current_user: User = Depends(get_current_user)):
+    if current_user.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin access required"
+        )
+    return current_user
 
 @app.post("/notes", response_model=NoteOut, status_code=status.HTTP_201_CREATED)
 async def create_note(note: NoteCreate):
@@ -113,30 +155,53 @@ async def get_all_notes(limit: int = Query(default=10, le=100)):
     return notes
 
 @app.get("/notes/{note_id}", response_model=NoteOut)
-async def get_note(note_id: str):
+async def get_note(
+    note_id: str,
+    x_cache_control: Optional[str] = Header(None)
+):
+    start_time = time.time()
+
+    # Check if cache should be bypassed
+    bypass_cache = x_cache_control == "no_cache"
+
+    # Try cache first (unless bypassed)
+    if not bypass_cache:
+        cached_note = await cache_get(f"note:{note_id}")
+        if cached_note:
+            elapsed = time.time() - start_time
+            print(f"Cache hit for note:{note_id} {elapsed:.2f}ms")
+            # Converting ISO string back to datetime for response
+            cached_note["created_at"] = datetime.fromisoformat(cached_note["created_at"])
+            return cached_note
+
     # Validate ObjectId format
     if not ObjectId.is_valid(note_id):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid note ID format")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid note ID")
 
     mongodb = get_mongodb()
     note = await mongodb.notes.find_one({"_id": ObjectId(note_id)})
 
     if not note:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Note not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Note not found")
 
     note["_id"] = str(note["_id"])
+
+    # Prepare cache-friendly version (datetime -> ISO string)
+    cache_note = note.copy()
+    cache_note["created_at"] = note["created_at"].isoformat()
+
+    # Store in cache for future requests
+    await cache_set(f"note:{note_id}", cache_note)
+
+    elapsed = time.time() - start_time
+    print(f"Cache miss for note:{note_id} {elapsed:.2f}ms")
+
     return note
 
 @app.put("/notes/{note_id}", response_model=NoteOut)
 async def update_note(note_id: str, note_update: NoteUpdate):
     if not ObjectId(note_id):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid note ID format")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid note ID")
 
     db = get_mongodb()
 
@@ -144,9 +209,7 @@ async def update_note(note_id: str, note_update: NoteUpdate):
     update_data = note_update.model_dump(exclude_unset=True)
 
     if not update_data:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No fields provided for update")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No fields to update")
 
     # Update the note
     result = await db.notes.update_one(
@@ -155,29 +218,30 @@ async def update_note(note_id: str, note_update: NoteUpdate):
     )
 
     if result.matched_count == 0:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Note not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Note not found")
+
+    # Invalidate cache (CRITICAL!)
+    await cache_delete(f"note:{note_id}")
 
     # Retrieve and return updated note
     updated_note = await db.notes.find_one({"_id": ObjectId(note_id)})
-    return note_helper(updated_note)
+    updated_note["_id"] = str(updated_note["_id"])
+    return updated_note
 
 @app.delete("/notes/{note_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_note(note_id: str):
     # Validate ObjectId format
     if not ObjectId(note_id):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid note ID format")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid note ID")
 
     mongodb = get_mongodb()
     result = await mongodb.notes.delete_one({"_id": ObjectId(note_id)})
 
     if result.deleted_count == 0:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Note not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Note not found")
+
+    # Invalidate cache (CRITICAL!)
+    await cache_delete(f"note:{note_id}")
 
     # Delete from Elasticsearch
     es = get_elasticsearch()
@@ -187,6 +251,31 @@ async def delete_note(note_id: str):
         print(f"Error deleting note from Elasticsearch: {e}")
 
     return None
+
+@app.get("/cache/stats")
+async def cache_stats():
+    from .redis_client import get_redis
+    redis = get_redis()
+
+    info = await redis.info()
+
+    total_commands = info.get("total_commands_processed", 0)
+    keyspace_hits = info.get("keyspace_hits", 0)
+    keyspace_misses = info.get("keyspace_misses", 0)
+
+    total_requests = keyspace_hits + keyspace_misses
+    hit_rate = (keyspace_hits / total_requests * 100) if total_requests > 0 else 0
+
+    return {
+        "total_commands": total_commands,
+        "keyspace_hits": keyspace_hits,
+        "keyspace_misses": keyspace_misses,
+        "hit_rate_percent": round(hit_rate, 2)
+    }
+
+@app.delete("/cache/notes", status_code=status.HTTP_204_NO_CONTENT)
+async def clear_cache(admin: User = Depends(require_admin)):
+    await cache_delete_pattern("note:*")
 
 @app.get("/search", response_model=list[SearchResult], status_code=status.HTTP_200_OK)
 async def search_notes(
@@ -233,43 +322,6 @@ async def search_notes(
         results.append(result)
 
     return results
-
-# HTTPBearer scheme for token authentication
-security = HTTPBearer()
-
-# Dependency: Get current authenticated user
-def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
-    db: Session = Depends(get_db)
-) -> User:
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-
-    # Extract token from credentials
-    token = credentials.credentials
-
-    # Decode token
-    email = decode_access_token(token)
-    if email is None:
-        raise credentials_exception
-
-    # Get user from database
-    user = db.query(User).filter(User.email == email).first()
-    if user is None:
-        raise credentials_exception
-
-    return user
-
-def require_admin(current_user: User = Depends(get_current_user)):
-    if current_user.role != "admin":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Admin access required"
-        )
-    return current_user
 
 @app.post("/auth/signup", response_model=UserOut, status_code=status.HTTP_201_CREATED)
 def signup(user_data: UserCreate, db: Session = Depends(get_db)):
