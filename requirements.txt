@@ -11,7 +11,7 @@ pydantic==2.10.2          # Data validation using Python type hints
 pydantic[email]           # Adds email validation support
 
 motor==3.4.0
-pymongo==4.6.0
+pymongo==4.6.3
 
 bcrypt==4.0.1                      # Password hashing library
 passlib[bcrypt]==1.7.4             # Password hashing with bcrypt
