@@ -2,11 +2,14 @@
 fastapi==0.115.5          # The web framework
 uvicorn[standard]==0.34.0 # ASGI server to run FastAPI
 python-dotenv==1.0.1      # Load environment variables from .env
+
 SQLAlchemy==2.0.31        # ORM for database operations
 psycopg2-binary==2.9.10   # PostgreSQL database adapter for Python
 alembic==1.13.2           # Database migration tool
+
 pydantic==2.10.2          # Data validation using Python type hints
 pydantic[email]           # Adds email validation support
+
 motor==3.4.0
 pymongo==4.6.0
 
